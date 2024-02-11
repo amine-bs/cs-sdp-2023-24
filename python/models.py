@@ -2,6 +2,8 @@ import pickle
 from abc import abstractmethod
 
 import numpy as np
+from gurobipy import *
+
 
 
 class BaseModel(object):
@@ -171,7 +173,7 @@ class TwoClustersMIP(BaseModel):
     You have to encapsulate your code within this class that will be called for evaluation.
     """
 
-    def __init__(self, n_pieces, n_clusters):
+    def __init__(self, n_pieces = 5, n_clusters = 2, n = 4, PRECISION = 1e-6, max_iterations = 1000):
         """Initialization of the MIP Variables
 
         Parameters
@@ -183,11 +185,37 @@ class TwoClustersMIP(BaseModel):
         """
         self.seed = 123
         self.model = self.instantiate()
+        self.L = n_pieces 
+        self.K = n_clusters
+        self.n = n
+        self.PRECISION = PRECISION
+        self.max_iterations = max_iterations
 
     def instantiate(self):
-        """Instantiation of the MIP Variables - To be completed."""
+        """Instantiation of the MIP Variables - To be completed.""" # We cannot instantiate the MIP variables because we can only know how many variable we have once we have the training data.
         # To be completed
-        return
+
+        return Model("MIP")
+
+    def u_k_i(self, k, i, x, training=True):
+
+        width = 1/self.L
+        l = int(x / width)
+        a = x/width - l
+        if training:
+            u_left = self.criteria[k-1][i-1][l]
+            u_right = self.criteria[k-1][i-1][l+1]
+        else:
+            u_left = self.criteria[k-1][i-1][l].x
+            u_right = self.criteria[k-1][i-1][l+1].x
+        return u_left + a * (u_right - u_left)
+    
+    def u_k(self, k, x, training=True):
+        if training:
+            return quicksum(self.u_k_i(k, i, x[i-1]) for i in range(1, self.n + 1))
+        else:
+            return sum([self.u_k_i(k, i, x[i-1], training=False) for i in range(1, self.n + 1)])
+        
 
     def fit(self, X, Y):
         """Estimation of the parameters - To be completed.
@@ -200,8 +228,55 @@ class TwoClustersMIP(BaseModel):
             (n_samples, n_features) features of unchosen elements
         """
 
-        # To be completed
-        return
+        np.random.seed(self.seed)
+
+        self.criteria = [[[self.model.addVar(name=f"u_{k}_{i}_{l}") for l in range(self.L+1)] for i in range(1, self.n + 1)] for k in range(1, self.K + 1)]
+
+        P = X.shape[0]
+        self.sigma_plus = [self.model.addVar(name=f"sigma+_{j}", lb=0) for j in range(1, P + 1)]
+        self.sigma_minus = [self.model.addVar(name=f"sigma-_{j}", lb=0) for j in range(1, P + 1)]
+
+        self.pref = [[self.model.addVar(name=f"z_{k}_{j}", vtype=GRB.BINARY) for j in range(1, P + 1)] for k in range(1, self.K + 1)]
+
+        for k in range(1, self.K + 1):
+            for i in range(1, self.n + 1):
+                self.model.addConstr(self.criteria[k-1][i-1][0] == 0)
+            
+        for k in range(1, self.K + 1):
+            self.model.addConstr(quicksum(self.criteria[k-1][i-1][self.L] for i in range(1, self.n+1)) == 1)
+
+
+        for k in range(1, self.K + 1):
+            for i in range(1, self.n + 1):
+                for l in range(0, self.L):
+                    self.model.addConstr(self.criteria[k-1][i-1][l+1] - self.criteria[k-1][i-1][l] >= self.PRECISION)
+
+        for j in range(1, P+1):
+            self.model.addConstr(quicksum(self.pref[k-1][j-1] for k in range(1, self.K+1)) == 1)
+
+        for j in range(1, P + 1): 
+            x = X[j-1]
+            y = Y[j-1]
+            for k in range(1, self.K + 1):
+                self.model.addConstr(self.u_k(k=k, x=x) - self.u_k(k=k, x=y) - self.sigma_minus[j-1] + self.sigma_plus[j-1] >= 2*(1 - self.pref[k-1][j-1]))
+                #self.model.addConstr(self.u_k(k=k, x=x) - self.u_k(k=k, x=y) - self.sigma_minus[j-1] + self.sigma_plus[j-1] + self.PRECISION <= 2*self.pref[k-1][j-1])
+
+                self.model.addConstr(self.u_k(k=k, x=x) - self.u_k(k=k, x=y) + self.PRECISION <= 2*self.pref[k-1][j-1])
+
+
+
+        self.model.setObjective(sum(self.sigma_plus) + sum(self.sigma_minus), GRB.MINIMIZE)      
+        #self.model.setObjective(sum(self.sigma_plus) + sum(self.sigma_minus) + 100000000 * sum([x for k in self.pref for x in k]), GRB.MINIMIZE)     
+        if self.max_iterations is not None:
+            self.model.params.IterationLimit = self.max_iterations
+        self.model.optimize()
+
+        result = [[[self.criteria[k-1][i-1][l].x for l in range(0, self.L+1)] for i in range(1, self.n + 1)] for k in range(1, self.K+1)]
+        pref = [[self.pref[k-1][j-1].x for j in range(1, P + 1)] for k in range(1, self.K + 1)]
+        self.result_utility_ = np.array(result)
+        self.result_pref_ = np.array(pref)
+        
+        return self
 
     def predict_utility(self, X):
         """Return Decision Function of the MIP for X. - To be completed.
@@ -218,7 +293,12 @@ class TwoClustersMIP(BaseModel):
         """
         # To be completed
         # Do not forget that this method is called in predict_preference (line 42) and therefor should return well-organized data for it to work.
-        return
+
+        U = []
+        for p in range(1, len(X)+1):
+            utilities = [self.u_k(k, X[p-1], training=False) for k in range(1, self.K+1)]
+            U.append(utilities)
+        return np.array(U)
 
 
 class HeuristicModel(BaseModel):
