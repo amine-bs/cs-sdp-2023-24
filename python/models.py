@@ -303,7 +303,7 @@ class HeuristicModel(BaseModel):
     You have to encapsulate your code within this class that will be called for evaluation.
     """
 
-    def __init__(self, n_pieces=5, n_clusters=3, n=10, PRECISION=1e-6, P=400):
+    def __init__(self, n_pieces=5, n_clusters=3, n=10, PRECISION=1e-6, P=20000):
         """Initialization of the Heuristic Model.
         """
         self.seed = 123
